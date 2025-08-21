@@ -2,6 +2,56 @@
 This repo is part of the work presented at the [6th South-East Europe Design Automation, Computer Engineering, Computer Networks and Social Media Conference (SEEDA-CECNSM 2021), Preveza, Greece, September 24th-26th 2021](https://seeda2021.uowm.gr/) and published in [IEEE Xplore](https://ieeexplore.ieee.org/document/9566259).
  
 # Paper: "Workflow on CNN utilization and inference in FPGA for embedded applications"
+## workflow diagram of the project
+<img src="https://github.com/ICscholar/dnndk-zedboard/blob/main/workflow_diagram.png" widht="600" height="450">
+下面把这张流程图按“离线→编译→上板→运行”的顺序细细拆解。它描述的是把一个用 TensorFlow 训练好的 CNN（以 MNIST 为例）部署到 Xilinx ZedBoard 上、在 DPU（Deep-learning Processing Unit）上做推理的完整流水线。
+
+## 1) 离线阶段：数据与模型
+1. **MNIST dataset**
+   * 仅作为示例数据集。
+   * 图里有两条细箭头：
+     * **train** → 送给 TensorFlow 训练模型；
+     * **test** → 以后在板子上做推理验证（不是训练）。
+
+2. **CNN Model & Optimizations (TensorFlow)**
+   * 在主机上训练并做基本优化（如结构调整、BN 融合、Dropout 只在训练中等）。
+   * 产出一个浮点模型（通常是 `.pb` / SavedModel）。
+
+3. **Compression (DECENT)**
+   * **DECENT** 是 Xilinx 的量化/剪枝工具链（老版本名称，核心是把浮点模型转成 **INT8**）。
+   * 需要一小部分“校准数据”（可用 MNIST 的一部分），计算量化尺度，得到**定点化模型**，体积更小、上板速度更快。
+
+## 2) 硬件准备：在 Vivado 做 DPU
+4. **Hardware Design in Vivado**
+   * 在 Vivado 里搭一个包含 **DPU** 的硬件设计（选择 DPU 的架构、时钟、AXI 互连等）。
+
+5. **Modify DPU parameters**
+   * 按需求调 DPU 参数：如阵列大小、核数、缓存配置等（常见型号如 B4096/B2304 之类）。
+   * 这些参数将影响编译器映射与最终性能。
+
+6. **Synthesis & BitStream**
+   * 综合、实现并导出 **Bitstream** 与硬件描述文件。
+   * 流程图中特别标注会得到一个 **`.hwh`** 文件：这是“硬件信息（Hardware Handoff）”，编译器用它了解 DPU 的具体结构与地址映射。
+
+## 3) 模型编译：把定点网络映射到 DPU
+7. **Compilation (DNNC)**
+   * **DNNC**（DPU Neural Network Compiler）读取：
+
+     * 上一步的 **`.hwh`**（知道硬件长什么样），
+     * **DECENT 输出的定点模型**（知道网络算子与张量精度），
+     * 可选的目标频率/批大小等参数。
+   * 产出 **可在 DPU 上运行的二进制**，图里标注为 **`(.elf)`**（常见命名如 `dpu_<model>.elf`），以及模型元数据。
+
+## 4) 应用与运行时：DNNDK 与上板
+8. **DNNDK & Application directory**
+   * **DNNDK** 提供 DPU 运行
+
+图里的 **“(ftp)”** 指的是用 **FTP（File Transfer Protocol，文件传输协议）** 通过网络把文件从主机拷到 ZedBoard。
+在这个流程中，它提示：把 **模型 `dpu_*.elf`** 和 **应用可执行文件** 等产物通过 FTP 传到板子上的指定目录。
+补充：
+* 实际操作可用命令行 `ftp <板子IP>` 或图形工具（如 FileZilla）。
+* 由于 **FTP 明文传输**，更安全的替代是 **SCP/SFTP**（基于 SSH）。
+
 
 # Citation
 If you use this work in academic research, please, cite it using the following BibTeX:
