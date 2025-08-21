@@ -52,6 +52,186 @@ This repo is part of the work presented at the [6th South-East Europe Design Aut
 * 实际操作可用命令行 `ftp <板子IP>` 或图形工具（如 FileZilla）。
 * 由于 **FTP 明文传输**，更安全的替代是 **SCP/SFTP**（基于 SSH）。
 
+按“做什么—装什么—怎么跑—命令含义”梳理成中文说明，并补充一些易错点。
+
+# 项目概述
+
+* **仓库名**：dnndk-zedboard
+* **用途**：展示如何把 **TensorFlow** 训练的 **CNN（以 MNIST 为例）** 通过 **Xilinx DNNDK** 工具链量化、编译成 **DPU** 可执行内核，并在 **ZedBoard（Zynq-7000）** 上做推理。
+* **对应论文**：*Workflow on CNN utilization and inference in FPGA for embedded applications*（SEEDA-CECNSM 2021 / IEEE Xplore）。
+* **如果学术使用**：按 README 提供的 BibTeX 引用即可。
+
+---
+
+# 目录（README 中的大纲）
+
+* Installation（安装）
+
+  * ZedBoard SD 卡配置（板端环境）
+  * Host 端配置与内核生成（PC 侧工具）
+  * 在 ZedBoard 上编译应用并运行推理
+* Citation（引用）
+
+---
+
+# 一、ZedBoard 端：SD 卡与启动
+
+1. **硬件平台**：ZedBoard（Zynq-7000 SoC）。
+2. **拨码/跳线**：把 JP7–JP11、JP6 调到 **SD 卡启动**（硬件手册有图示）。
+3. **系统镜像**：下载 **ZedBoard 专用 DNNDK 镜像**（README 给了 Xilinx 链接）。
+4. **写卡**：解压后用 **balena Etcher** 写入 ≥8GB SD 卡。
+5. **连接串口**，上电启动，能进到 DNNDK 的 Linux 环境即可。
+
+> 这一步的产物：一张能启动的 SD 卡（含 Linux、驱动、DPU 运行时等）。
+
+---
+
+# 二、主机（PC）端：工具与环境
+
+* **系统**：Ubuntu 18.04 LTS。
+* **DNNDK 版本**：3.1（UG1327 v1.6 文档）。安装命令：
+
+  ```bash
+  sudo ./install.sh   # 在 dnndk/host_x86 目录下
+  ```
+
+  会装好 **DECENT（量化）**、**DNNC（编译器）**、**DDump/DLet** 等工具。
+* **深度学习环境**：建议用 **Anaconda** 建虚拟环境。仓库提供了 `decent_ecsa_lab.yml`：
+
+  ```bash
+  conda env create -f decent_ecsa_lab.yml
+  ```
+* **TensorFlow 版本**：1.12（README 给了 py2.7/py3.6 的 wheel）。
+
+  > 说明：用 **CPU** 也能跑，但相较 **GTX1050Ti(4GB)** 的 GPU，**延迟大约慢 5 倍**。
+
+---
+
+# 三、模型准备与精度校验
+
+项目已经附带：
+
+* **冻结图**（`freeze/frozen_graph.pb`）——由浮点 TF 模型导出；
+* **生成校准/测试图片**的脚本 `generate_images.py`。
+
+1. **验证浮点模型精度**
+
+   ```bash
+   python eval_graph.py \
+     --graph ./freeze/frozen_graph.pb \
+     --input_node images_in \
+     --output_node dense_1/BiasAdd
+   ```
+
+   期望：Top-1 ≈ **0.9902**，Top-5 ≈ **0.9999**。
+
+2. **DECENT 量化（INT8）**
+
+   ```bash
+   decent_q quantize \
+     --input_frozen_graph ./freeze/frozen_graph.pb \
+     --input_nodes images_in \
+     --output_nodes dense_1/BiasAdd \
+     --input_shapes ?,28,28,1 \
+     --input_fn graph_input_fn.calib_input \
+     --output_dir _quant
+   ```
+
+   * `--input_fn`：提供**校准数据**的函数（脚本中定义）。
+   * 输出会在 **`_quant/`** 下生成：
+
+     * `quantize_eval_model.pb`（评估用）
+     * `deploy_model.pb`（**部署用**）
+       量化后再验证一次（评估图）：
+
+   ```bash
+   python eval_graph.py \
+     --graph ./_quant/quantize_eval_model.pb \
+     --input_node images_in \
+     --output_node dense_1/BiasAdd
+   ```
+
+   期望：Top-1 ≈ **0.9904**，Top-5 ≈ **0.9999**（与浮点基本一致）。
+
+---
+
+# 四、DNNC 编译：生成 DPU 内核（模型 .elf）
+
+把量化后的部署模型映射到 DPU：
+
+```bash
+dnnc-dpu1.4.0 \
+  --parser=tensorflow \
+  --frozen_pb=_quant/deploy_model.pb \
+  --dcf=zedboard.dcf \
+  --cpu_arch=arm32 \
+  --output_dir=_deploy \
+  --net_name=mnist \
+  --save_kernel \
+  --mode=normal
+```
+
+参数解释：
+
+* `--parser=tensorflow`：解析 TF 模型；
+* `--frozen_pb`：量化后的 **部署图**；
+* `--dcf=zedboard.dcf`：**硬件描述**（与 DPU 配置匹配）。README 已提供；也可用 **DLet** 通过 Vivado 的 **`.hwh`** 生成；
+* `--cpu_arch=arm32`：ZedBoard 的 ARM 架构；
+* `--output_dir=_deploy`：输出目录；
+* `--net_name=mnist`：网络名（关系到生成文件的命名）；
+* `--save_kernel`：导出可加载的内核；
+* `--mode=normal`：常规优化模式。
+
+产物在 **`_deploy/`**，核心是 **模型内核 `*.elf`**（注意：这是**模型二进制**，和应用程序的可执行文件不是一回事）。
+
+---
+
+# 五、在板子上编译应用并运行
+
+1. **拷文件到板子**
+   README 提示用 **FTP** 把 `mnist_zedboard_inference` 目录传到板上（更安全也可用 **SCP/SFTP**）。
+2. **安装/编译/运行**
+
+   * **Step 1** 安装：
+
+     ```bash
+     ./install.sh
+     ```
+   * **Step 2** 在 `samples/mnist` 下用 **Makefile** 编译应用。
+   * **Step 3** 运行生成的可执行文件（应用会加载上面的**模型 .elf**），进行推理并按论文方式收集结果。
+
+---
+
+# 关键文件/文件夹对照
+
+* `freeze/`：冻结的浮点模型（`frozen_graph.pb`）。
+* `_quant/`：量化产物（`deploy_model.pb`、`quantize_eval_model.pb`）。
+* `_deploy/`：DNNC 编译产物（**模型内核 `dpu_*.elf`** 等）。
+* `mnist_zedboard_inference/`：板端应用源码与示例。
+* `zedboard.dcf`：DPU 硬件描述（可由 `.hwh` 用 DLet 生成）。
+* `decent_ecsa_lab.yml`：conda 环境文件。
+* `pkgs/`：DNNDK 提供的依赖包集合。
+
+---
+
+# 最小化“跑通”清单
+
+1. 按 README 做好 **SD 卡镜像+跳线**，能进板载系统。
+2. PC 端安装 **DNNDK 3.1**，用 conda 按 `decent_ecsa_lab.yml` 建环境。
+3. 运行 `generate_images.py` 生成校准/测试数据；用 `eval_graph.py` 验证浮点精度。
+4. `decent_q quantize` 得到 `_quant/deploy_model.pb` 并复验量化精度。
+5. `dnnc-dpu1.4.0 ...` 编译出 `_deploy` 下的 **模型 .elf**。
+6. 把 **模型 .elf** 和 **应用目录** 传到板上；`install.sh` → `make` → 运行，观察推理结果与性能。
+
+---
+
+# 常见坑 & 提示
+
+* **版本匹配**：DNNDK 版本、`zedboard.dcf`/`.hwh` 对应的 **DPU 配置** 必须一致。
+* **预处理一致性**：训练/量化/推理的输入归一化、尺寸、通道顺序一致，否则精度会偏。
+* **模型 vs 应用的 ELF**：一个是**模型内核**（DNNC 产物），一个是**程序可执行文件**（Makefile 编译）；不要混淆。
+* **传输方式**：FTP 明文不安全，实际可用 **SCP/SFTP**。
+* **CPU 仅推理**：能跑，但明显慢于文中 GPU 环境。
 
 # Citation
 If you use this work in academic research, please, cite it using the following BibTeX:
